@@ -1,0 +1,180 @@
+---
+title: "Predicting Loan Defaults and Debt-To-Income Ratios Using Loan Data"
+author: "Janelyn Geronimo"
+format: 
+  dashboard: 
+    self-contained: true
+---
+```{r}
+#| message: false
+library(ggplot2) # For making data viz
+library(dplyr) # Data manipulation
+library(janitor) # clean names
+library(tidymodels) #package for ML in R
+library(rpart.plot)
+library(pdp)
+library(vip)
+library(baguette)
+library(forcats)
+library(reshape2)
+library(gt)
+options(scipen = 999)
+```
+
+```{r load-data, cleaning}
+fd <- read.csv("Loan_default.csv") |> 
+  clean_names() |> 
+  mutate(has_mortgage = as.factor(has_mortgage),
+         has_co_signer = as.factor(has_co_signer),
+         has_dependents = as.factor(has_dependents),
+         default = as.factor(default),
+         education = as.factor(education),
+         employment_type = as.factor(employment_type),
+         marital_status = as.factor(marital_status),
+         loan_purpose = as.factor(loan_purpose))
+
+fd <- subset(fd, select = -loan_id)
+
+set.seed(173)
+fd_split <- rsample::initial_split(fd, prop = .7, strata = default)
+fd_train <- rsample::training(fd_split)
+fd_test <- rsample::testing(fd_split)
+```
+
+## Row {.tabset}
+
+### Default vs. Non-Default
+
+```{r exploratory-analyses}
+fd_default_counts <- fd |> 
+  group_by(default) |> 
+  summarize(total = n()) |> 
+  mutate(default = factor(default, levels = c(0, 1), labels = c("No Default", "Default")))
+
+p <- ggplot(data = fd_default_counts, aes(x=default,y=total))
+
+p + geom_col(fill = "steelblue") + geom_text(aes(label = total), vjust = -0.5) + labs(y = "Group total", x = "Default Group") + theme_light()
+```
+
+*This bar chart shows the total number of defaults and non-defaults in the dataset. Clearly, non-defaults outnumber defaults greatly, with 225694 non-defaults and 29653 defaults.*
+
+### Distributions of Key Variables
+
+```{r}
+fd_melt <- fd |> 
+  mutate(default = factor(default, levels = c(0, 1), labels = c("No Default", "Default")))
+
+fd_melt <- melt(fd_melt, id.vars = "default", measure.vars = c("income","loan_amount","credit_score","age","months_employed","dti_ratio"))
+
+
+p1 <- ggplot(data = fd_melt, aes(x = factor(default), y = value, color = factor(default))) +
+  geom_boxplot() +
+  facet_wrap(~variable, scales = "free_y") +
+  labs(x = "", y = "Value", color = "Default Group") +
+  theme_minimal()
+
+p1
+```
+*The boxplots show the distributions of selected variables grouped by people that defaulted vs. did not default on their loans. Looking at the boxplot, we can see that the median income, age, credit score, and months of employment are lower for people that defaulted on their loans compared to those that did not. Loan defaulters also seem to have a higher debt to income ratio, as well as loan amount than non defaulters.*
+
+### Predicting Default: Simple Classification
+
+```{r fitting-models-qualitative}
+#introduce qualitative classification - whether or not someone will default based on vars
+my_class_metrics <- metric_set(accuracy, sensitivity, specificity, precision)
+simple_classification_fd <- fd_train
+simple_classification_fd <- simple_classification_fd |> 
+  mutate(pred = factor(0, levels = c(0, 1)))
+
+simple_classification_train <- simple_classification_fd |> 
+  my_class_metrics(truth = default, estimate = pred) 
+simple_classification_train |> gt()
+```
+*Because the dataset is incredibly imbalanced (only 11.6% default) and we wish to predict whether someone defaults on their loan or not, creating a simple model first as a benchmark would help us see where we can improve future models. By classifying all borrowers as non-defaults, our prediction is 88% accurate. While this sounds good without any further context, our specificity of 0 means that none of the people that defaulted will ever be identified. Thus, through the other machine learning models we will fit, we hope to improve these metrics.*
+
+### Predicting Default: Logistic Regression
+
+```{r logistic-model}
+loan_default_setup <- logistic_reg() |> set_engine("glm") |> set_mode("classification")
+loan_default_fit <- loan_default_setup |> fit(default ~ ., data = fd_train)
+
+vip(loan_default_fit$fit, aesthetics = list(fill = "#6e0000", col = "black")) + theme_bw()
+
+loan_default_train_pred <- loan_default_fit |> augment(fd_train)
+loan_default_test_pred <- loan_default_fit |> augment(fd_test)
+
+```
+```{r}
+my_class_metrics(loan_default_train_pred, truth = default, estimate = .pred_class, event_level = "second")|> gt()
+```
+```{r}
+
+my_class_metrics(loan_default_test_pred, truth = default, estimate = .pred_class, event_level = "second")|> gt()
+```
+
+
+### Predicting Default: Bagged Tree
+
+```{r bagged-tree}
+set.seed(8)
+loan_default_bagging_setup <- bag_tree(tree_depth = 5) |> set_engine("rpart", times = 20) |> set_mode("classification")
+loan_default_bagging_fit <- loan_default_bagging_setup |> fit(default ~ ., data = fd_train)
+
+loan_default_var_impotance_df <- loan_default_bagging_fit$fit$imp |> arrange(desc(-value)) |> mutate(term = factor(term, term))
+
+ggplot(loan_default_var_impotance_df, aes(x = term, y = value)) +
+  geom_col(fill = "#6e0000") +
+  labs(x = "Variable", y = "Importance") +
+  coord_flip() + theme_bw()
+
+loan_default_pred_bagging_train <- loan_default_bagging_fit |> augment(fd_train)
+loan_default_pred_bagging_test <- loan_default_bagging_fit |> augment(fd_test)
+```
+```{r}
+my_class_metrics(loan_default_pred_bagging_train, truth = default, estimate = .pred_class, event_level = "second") |> gt()
+```
+```{r}
+my_class_metrics(loan_default_pred_bagging_test, truth = default, estimate = .pred_class, event_level = "second") |> gt()
+```
+
+### Predicting Default: Random Forest
+
+```{r random-forest}
+set.seed(9)
+loan_default_rf_setup <- rand_forest(mtry = 3, trees = 200) |> set_engine("ranger", importance = "impurity") |> set_mode("classification")
+loan_default_rf_fit <- loan_default_rf_setup |> fit(default ~ ., data = fd_train)
+
+vip(loan_default_rf_fit, aesthetics = list(fill = "#6e0000", col = "black")) + theme_bw()
+
+loan_default_pred_rf_train <- loan_default_rf_fit |> augment(fd_train)
+loan_default_pred_rf_test <- loan_default_rf_fit |> augment(fd_test)
+
+```
+```{r}
+my_class_metrics(loan_default_pred_rf_train, truth = default, estimate = .pred_class, event_level = "second") |> gt()
+```
+```{r}
+my_class_metrics(loan_default_pred_rf_test, truth = default, estimate = .pred_class, event_level = "second") |> gt()
+```
+
+### Predicting Debt-to-Income Ratio
+
+```{r dti-model}
+dti_reg <- linear_reg() |> set_engine("lm") |> set_mode("regression")
+dti_reg_fit <- dti_reg |> fit(dti_ratio ~ ., data = fd_train)
+
+vip(dti_reg_fit, aesthetics = list(fill = "6e0000", col = "black"))
+
+pred_dti_fit <- dti_reg_fit |> augment(fd_train)
+pred_dti_fit_test <- dti_reg_fit |> augment(fd_test)
+
+my_reg_metrics <- metric_set(rmse, mae, rsq)
+
+```
+```{r}
+my_reg_metrics(pred_dti_fit, truth = dti_ratio, estimate = .pred) |> gt()
+```
+```{r}
+my_reg_metrics(pred_dti_fit_test, truth = dti_ratio, estimate = .pred) |> gt()
+```
+
